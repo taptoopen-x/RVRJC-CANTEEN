@@ -1,4 +1,3 @@
-
 import sqlite3
 import uuid
 import datetime
@@ -7,8 +6,13 @@ from io import BytesIO
 
 import pandas as pd
 import qrcode
-import requests
 import streamlit as st
+
+# ============================================================
+# CAMPUSBITES — DEMO QR + PAYMENT METHODS
+# No Razorpay account or payment credentials required.
+# All payments in this version are simulations only.
+# ============================================================
 
 st.set_page_config(
     page_title="CampusBites Zero-Touch Canteen",
@@ -18,22 +22,15 @@ st.set_page_config(
 
 DB = str(Path(__file__).parent / "campusbites.db")
 
-# Razorpay credentials must be stored in Streamlit Secrets.
+# Demo staff PIN. For a college presentation only.
+# You can set app.staff_pin in Streamlit Secrets to change it.
 try:
-    RZP_KEY = st.secrets["razorpay"]["key_id"]
-    RZP_SECRET = st.secrets["razorpay"]["key_secret"]
-except Exception:
-    RZP_KEY = ""
-    RZP_SECRET = ""
-
-try:
-    APP_URL = st.secrets["app"]["public_url"].rstrip("/")
     STAFF_PIN = str(st.secrets["app"]["staff_pin"])
 except Exception:
-    APP_URL = ""
-    STAFF_PIN = ""
+    STAFF_PIN = "1234"
 
-# ---------------- DATABASE ----------------
+
+# ========================== DATABASE ==========================
 
 def db():
     conn = sqlite3.connect(DB, timeout=20)
@@ -69,11 +66,13 @@ def init_db():
                 payment_status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 razorpay_link_id TEXT DEFAULT '',
-                payment_id TEXT DEFAULT ''
+                payment_id TEXT DEFAULT '',
+                payment_method TEXT DEFAULT 'Scan QR (Demo)'
             )
         """)
 
-        # Upgrade an existing database without deleting its records.
+        # Add missing columns to existing databases without
+        # deleting existing orders.
         existing = {
             row["name"]
             for row in conn.execute(
@@ -86,6 +85,7 @@ def init_db():
             "student_id": "TEXT DEFAULT ''",
             "razorpay_link_id": "TEXT DEFAULT ''",
             "payment_id": "TEXT DEFAULT ''",
+            "payment_method": "TEXT DEFAULT 'Scan QR (Demo)'",
         }
 
         for column, definition in migrations.items():
@@ -146,21 +146,26 @@ def get_order(order_id):
 
 
 def allocate_order(student_name, student_id, cart, total):
-    # Allocate a unique token and order ID in one transaction.
+    """Create an order with a unique ID and pickup token."""
+
+    if not cart:
+        raise ValueError("Your basket is empty.")
+
     items_text = ", ".join(
-        f"{x['name']} x{x['qty']}" for x in cart
+        f"{item['name']} x{item['qty']}" for item in cart
     )
-    food_total = sum(x["price"] * x["qty"] for x in cart)
-    fee = round(total * 0.0236, 2)
-    net = round(total - fee, 2)
+
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
+
         row = conn.execute(
             "SELECT value FROM settings WHERE key='token_counter'"
         ).fetchone()
+
         token = int(row["value"]) + 1
+
         conn.execute(
             "UPDATE settings SET value=? WHERE key='token_counter'",
             (str(token),),
@@ -175,218 +180,100 @@ def allocate_order(student_name, student_id, cart, total):
             INSERT INTO orders(
                 order_id, token, student_name, student_id,
                 items, total, gateway_fee, net_amount,
-                status, payment_status, created_at
+                status, payment_status, created_at, payment_method
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            order_id, token, student_name, student_id,
-            items_text, total, fee, net,
-            "Awaiting Payment", "Pending", now,
+            order_id,
+            token,
+            student_name,
+            student_id,
+            items_text,
+            total,
+            0.00,
+            total,
+            "Awaiting Payment",
+            "Pending",
+            now,
+            "Scan QR (Demo)",
         ))
 
     return order_id, token
 
 
-# ---------------- RAZORPAY ----------------
+# ======================= DEMO PAYMENT ========================
 
-def razorpay_ready():
-    return bool(RZP_KEY and RZP_SECRET and APP_URL.startswith("https://"))
+def make_qr(text):
+    """Generate a QR image from the supplied text."""
 
-
-def create_payment_link(order_id):
-    """Create a real Razorpay hosted checkout link."""
-
-    if not razorpay_ready():
-        raise RuntimeError(
-            "Payment is not configured. Add Razorpay keys and the public "
-            "HTTPS app URL in Streamlit Secrets."
-        )
-
-    order = get_order(order_id)
-    if not order:
-        raise RuntimeError("Order not found.")
-
-    if order["payment_status"] == "Paid":
-        raise RuntimeError("This order has already been paid.")
-
-    if order["razorpay_link_id"]:
-        response = requests.get(
-            "https://api.razorpay.com/v1/payment_links/"
-            + order["razorpay_link_id"],
-            auth=(RZP_KEY, RZP_SECRET),
-            timeout=20,
-        )
-        response.raise_for_status()
-        link = response.json()
-
-        if link.get("status") == "paid":
-            verify_payment_link(link["id"])
-            raise RuntimeError(
-                "Razorpay reports this payment as paid. Refresh the app."
-            )
-
-        if link.get("status") in ("created", "issued"):
-            return link["short_url"]
-
-        raise RuntimeError(
-            "The existing payment link is no longer payable. "
-            "Please contact the canteen staff."
-        )
-
-    payload = {
-        "amount": int(round(float(order["total"]) * 100)),
-        "currency": "INR",
-        "accept_partial": False,
-        "reference_id": order["order_id"],
-        "description": f"CampusBites order {order['order_id']}",
-        "customer": {"name": order["student_name"]},
-        "notify": {"sms": False, "email": False},
-        "reminder_enable": False,
-        "callback_url": APP_URL,
-        "callback_method": "get",
-        "notes": {
-            "student_id": str(order["student_id"])[:200],
-            "pickup_token": str(order["token"]),
-        },
-    }
-
-    response = requests.post(
-        "https://api.razorpay.com/v1/payment_links",
-        json=payload,
-        auth=(RZP_KEY, RZP_SECRET),
-        timeout=20,
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=7,
+        border=3,
     )
-    response.raise_for_status()
-    link = response.json()
-
-    with db() as conn:
-        conn.execute("""
-            UPDATE orders SET razorpay_link_id=?
-            WHERE order_id=?
-        """, (link["id"], order_id))
-
-    return link["short_url"]
-
-
-def verify_payment_link(link_id):
-    """Check payment with Razorpay's authenticated server API."""
-
-    if not razorpay_ready():
-        return False, "Razorpay credentials are not configured."
-
-    response = requests.get(
-        "https://api.razorpay.com/v1/payment_links/" + link_id,
-        auth=(RZP_KEY, RZP_SECRET),
-        timeout=20,
-    )
-    response.raise_for_status()
-    link = response.json()
-
-    with db() as conn:
-        order = conn.execute("""
-            SELECT * FROM orders WHERE razorpay_link_id=?
-        """, (link_id,)).fetchone()
-
-        if not order:
-            return False, "No matching order found."
-
-        expected_amount = int(round(float(order["total"]) * 100))
-
-        if link.get("reference_id") != order["order_id"]:
-            return False, "Payment reference does not match the order."
-
-        if int(link.get("amount", -1)) != expected_amount:
-            return False, "Payment amount does not match the order."
-
-        if link.get("status") != "paid":
-            return False, "Payment is not confirmed yet."
-
-        if int(link.get("amount_paid", 0)) != expected_amount:
-            return False, "The confirmed payment amount does not match."
-
-        payment_id = ""
-        for payment in link.get("payments", []):
-            if payment.get("status") == "captured":
-                payment_id = payment.get("payment_id", "")
-                break
-
-        # Only update the order after the server-side checks pass.
-        conn.execute("""
-            UPDATE orders
-            SET payment_status='Paid',
-                payment_id=?,
-                status=CASE
-                    WHEN status='Awaiting Payment' THEN 'Preparing'
-                    ELSE status
-                END
-            WHERE order_id=?
-              AND razorpay_link_id=?
-              AND payment_status!='Paid'
-        """, (payment_id, order["order_id"], link_id))
-
-    return True, "Payment verified with Razorpay."
-
-
-def handle_payment_return():
-    link_id = st.query_params.get("razorpay_payment_link_id")
-    reference = st.query_params.get(
-        "razorpay_payment_link_reference_id"
-    )
-
-    if not link_id:
-        return
-
-    try:
-        ok, message = verify_payment_link(link_id)
-
-        order = None
-        with db() as conn:
-            order = conn.execute("""
-                SELECT order_id FROM orders WHERE razorpay_link_id=?
-            """, (link_id,)).fetchone()
-
-        if not order or reference != order["order_id"]:
-            ok = False
-            message = "The payment return did not match the saved order."
-
-        st.session_state["payment_notice"] = (ok, message)
-
-    except Exception:
-        st.session_state["payment_notice"] = (
-            False,
-            "Payment could not be checked right now. Use Check Payment "
-            "Status below or contact the canteen staff.",
-        )
-    finally:
-        st.query_params.clear()
-        st.rerun()
-
-
-def make_qr(url):
-    qr = qrcode.QRCode(box_size=6, border=2)
-    qr.add_data(url)
+    qr.add_data(text)
     qr.make(fit=True)
-    image = qr.make_image(fill_color="black", back_color="white")
+
+    image = qr.make_image(
+        fill_color="black",
+        back_color="white",
+    )
+
     buffer = BytesIO()
     image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    buffer.seek(0)
+
+    return buffer
 
 
-# ---------------- UTILITIES ----------------
+def demo_qr_text(order):
+    """
+    QR contains order information only.
+    It is NOT a UPI QR and cannot transfer money.
+    """
+
+    return (
+        "CAMPUSBITES - DEMO ONLY\n"
+        "NOT A REAL PAYMENT QR\n"
+        f"Order ID: {order['order_id']}\n"
+        f"Pickup Token: {order['token']}\n"
+        f"Student: {order['student_name']}\n"
+        f"Amount: INR {float(order['total']):.2f}\n"
+        "No money transferred."
+    )
+
+
+def mark_demo_payment(order_id):
+    """
+    Record a simulated payment.
+    This does not collect or verify real money.
+    """
+
+    demo_payment_id = "DEMO-" + uuid.uuid4().hex[:10].upper()
+
+    with db() as conn:
+        result = conn.execute("""
+            UPDATE orders
+            SET payment_status='Demo Paid',
+                payment_id=?,
+                status='Preparing'
+            WHERE order_id=?
+              AND payment_status='Pending'
+              AND status='Awaiting Payment'
+        """, (demo_payment_id, order_id))
+
+    return result.rowcount == 1
+
+
+# ========================== UTILITIES ========================
 
 def staff_allowed(pin):
-    if not STAFF_PIN:
-        st.error("Set app.staff_pin in Streamlit Secrets first.")
+    if pin != STAFF_PIN:
+        st.error("Enter the correct staff PIN to continue.")
         return False
-    return pin == STAFF_PIN
 
-
-def update_status(order_id, status):
-    with db() as conn:
-        conn.execute(
-            "UPDATE orders SET status=? WHERE order_id=?",
-            (status, order_id),
-        )
+    return True
 
 
 def reset_demo():
@@ -398,48 +285,79 @@ def reset_demo():
         """)
 
 
+def order_is_demo_paid(order):
+    return order["payment_status"] == "Demo Paid"
+
+
+# Initialize database and session state.
 init_db()
-handle_payment_return()
 
 if "cart" not in st.session_state:
     st.session_state.cart = []
 
-# ---------------- HEADER ----------------
+if "last_order_id" not in st.session_state:
+    st.session_state.last_order_id = None
+
+
+# =========================== DESIGN ==========================
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.5rem;}
+.block-container {
+    padding-top: 1.5rem;
+}
 .hero {
-    background: linear-gradient(120deg,#173d31,#2c8061);
+    background: linear-gradient(120deg, #173d31, #2c8061);
     padding: 1.5rem;
     border-radius: 18px;
     color: white;
     margin-bottom: 1rem;
 }
-.hero h1 {color: white; margin: 0;}
-.hero p {color: #e5f5ec; margin-top: .4rem;}
+.hero h1 {
+    color: white;
+    margin: 0;
+}
+.hero p {
+    color: #e5f5ec;
+    margin-top: .4rem;
+}
+.demo-banner {
+    background: #fff3cd;
+    border: 1px solid #e7c766;
+    color: #664d03;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+}
 </style>
+
 <div class="hero">
-<h1>🍱 CampusBites — Zero-Touch Canteen</h1>
-<p>Student ordering · Razorpay checkout · Unique pickup tokens</p>
+    <h1>🍱 CampusBites — Zero-Touch Canteen</h1>
+    <p>Student ordering · Demo QR · Payment choices · Unique pickup tokens</p>
+</div>
+
+<div class="demo-banner">
+    <b>DEMO MODE ONLY</b> — Payments are simulated.
+    No money is collected or transferred.
 </div>
 """, unsafe_allow_html=True)
 
-notice = st.session_state.pop("payment_notice", None)
-if notice:
-    if notice[0]:
-        st.success(notice[1])
-    else:
-        st.warning(notice[1])
 
 orders_now = get_orders()
+
 st.sidebar.header("🟢 System Status")
 st.sidebar.success("App online")
 st.sidebar.metric("Total orders", len(orders_now))
-st.sidebar.info(
-    "Real payment checkout requires your Razorpay credentials. "
-    "The QR below will open the actual hosted checkout link."
+st.sidebar.warning(
+    "Demo version: QR and payment options are simulations. "
+    "Do not enter real payment details."
 )
+st.sidebar.caption(
+    "Demo staff PIN: 1234, unless changed in Streamlit Secrets."
+)
+
+
+# ============================ TABS ===========================
 
 student_tab, kitchen_tab, pickup_tab, admin_tab = st.tabs([
     "📱 Student App",
@@ -448,14 +366,20 @@ student_tab, kitchen_tab, pickup_tab, admin_tab = st.tabs([
     "⚙️ Admin & Stress Test",
 ])
 
-# ---------------- STUDENT APP ----------------
+
+# ======================== STUDENT APP ========================
 
 with student_tab:
     st.subheader("📍 Today's Menu")
+
     menu = get_menu()
+
+    if not menu:
+        st.info("No menu items are currently available.")
 
     for item in menu:
         left, price_col, add_col = st.columns([4, 1, 1])
+
         left.markdown(f"**{item['name']}**")
         left.caption(
             f"{item['category']} · Available stock: {item['stock']}"
@@ -464,10 +388,13 @@ with student_tab:
 
         if add_col.button("Add", key=f"add_{item['id']}"):
             existing = next(
-                (x for x in st.session_state.cart
-                 if x["name"] == item["name"]),
+                (
+                    x for x in st.session_state.cart
+                    if x["name"] == item["name"]
+                ),
                 None,
             )
+
             if existing:
                 existing["qty"] += 1
             else:
@@ -476,6 +403,7 @@ with student_tab:
                     "price": float(item["price"]),
                     "qty": 1,
                 })
+
             st.rerun()
 
     st.divider()
@@ -483,11 +411,13 @@ with student_tab:
 
     if not st.session_state.cart:
         st.info("Your basket is empty.")
+
     else:
         new_cart = []
 
         for i, item in enumerate(st.session_state.cart):
             a, b, c, d = st.columns([5, 1, 1, 1])
+
             a.write(f"**{item['name']}**")
             b.write(f"₹{item['price']:.0f}")
             c.write(f"× {item['qty']}")
@@ -502,9 +432,10 @@ with student_tab:
 
         if st.session_state.cart:
             food_total = sum(
-                x["price"] * x["qty"]
-                for x in st.session_state.cart
+                item["price"] * item["qty"]
+                for item in st.session_state.cart
             )
+
             handling_fee = 1.00
             total = round(food_total + handling_fee, 2)
 
@@ -512,18 +443,41 @@ with student_tab:
             st.write(f"Handling fee: ₹{handling_fee:.2f}")
             st.markdown(f"## Final amount: ₹{total:.2f}")
 
+            st.divider()
+            st.subheader("🧾 Student Details")
+
             with st.form("checkout_form"):
                 student_name = st.text_input(
                     "Student full name",
                     max_chars=80,
                 )
+
                 student_id = st.text_input(
                     "College ID",
                     placeholder="Enter your college ID",
                     max_chars=40,
                 )
+
+                st.divider()
+                st.subheader("💳 Choose a Payment Method")
+
+                selected_payment_method = st.radio(
+                    "Payment options (demonstration only)",
+                    [
+                        "Scan QR (Demo)",
+                        "UPI ID / UPI App (Demo)",
+                        "Debit Card (Demo)",
+                        "Credit Card (Demo)",
+                    ],
+                )
+
+                st.caption(
+                    "Demo only. Do not enter real UPI IDs, PINs, "
+                    "or card details. No money will be transferred."
+                )
+
                 checkout = st.form_submit_button(
-                    "Create order and payment QR",
+                    "Create Demo Order",
                     type="primary",
                     use_container_width=True,
                 )
@@ -531,11 +485,7 @@ with student_tab:
             if checkout:
                 if not student_name.strip() or not student_id.strip():
                     st.error("Enter both your name and college ID.")
-                elif not razorpay_ready():
-                    st.error(
-                        "Razorpay is not configured yet. Follow the Secrets "
-                        "setup instructions below the code."
-                    )
+
                 else:
                     try:
                         order_id, token = allocate_order(
@@ -544,95 +494,166 @@ with student_tab:
                             st.session_state.cart,
                             total,
                         )
-                        payment_url = create_payment_link(order_id)
-                        st.session_state["last_order_id"] = order_id
-                        st.session_state["payment_url"] = payment_url
+
+                        with db() as conn:
+                            conn.execute("""
+                                UPDATE orders
+                                SET payment_method=?
+                                WHERE order_id=?
+                            """, (selected_payment_method, order_id))
+
+                        st.session_state.last_order_id = order_id
                         st.session_state.cart = []
+
                         st.rerun()
+
                     except Exception as exc:
-                        st.error("Could not create the payment checkout.")
-                        st.caption(str(exc))
+                        st.error("Could not create the demo order.")
+                        st.exception(exc)
 
             if st.button("🗑️ Empty Basket"):
                 st.session_state.cart = []
                 st.rerun()
 
+    # Display the latest order.
     last_id = st.session_state.get("last_order_id")
-    payment_url = st.session_state.get("payment_url")
 
     if last_id:
         order = get_order(last_id)
+
         if order:
             st.divider()
-            st.subheader("Your order")
-            st.metric("Pickup token", f"#{order['token']}")
+            st.subheader("📦 Your Order")
+
+            col1, col2 = st.columns(2)
+
+            col1.metric("Pickup Token", f"#{order['token']}")
+            col2.metric("Total Amount", f"₹{order['total']:.2f}")
+
             st.write("**Order ID:**", order["order_id"])
             st.write("**Student:**", order["student_name"])
             st.write("**College ID:**", order["student_id"])
             st.write("**Items:**", order["items"])
-            st.write(f"**Total:** ₹{order['total']:.2f}")
-            st.write("**Payment:**", order["payment_status"])
+            st.write("**Payment method:**", order["payment_method"])
+            st.write("**Payment status:**", order["payment_status"])
             st.write("**Kitchen status:**", order["status"])
 
-            if order["payment_status"] != "Paid":
-                if payment_url:
-                    st.image(
-                        make_qr(payment_url),
-                        width=220,
-                        caption="Scan to open Razorpay checkout",
-                    )
-                    st.link_button(
-                        "Pay with Razorpay",
-                        payment_url,
-                        use_container_width=True,
-                    )
-
-                if order["razorpay_link_id"]:
-                    if st.button("Check Payment Status"):
-                        try:
-                            ok, message = verify_payment_link(
-                                order["razorpay_link_id"]
-                            )
-                            if ok:
-                                st.success(message)
-                            else:
-                                st.warning(message)
-                            st.rerun()
-                        except Exception:
-                            st.error(
-                                "Could not check payment right now. Try again."
-                            )
-            else:
-                st.success(
-                    "Payment verified. Keep your order ID and pickup token."
+            if order["payment_status"] == "Pending":
+                st.warning(
+                    "DEMO ONLY — this is not a real payment. "
+                    "No money will be transferred."
                 )
 
-# ---------------- KITCHEN ----------------
+                if order["payment_method"] == "Scan QR (Demo)":
+                    st.markdown("#### 📱 Scan this Demo QR")
+
+                    st.image(
+                        make_qr(demo_qr_text(order)),
+                        width=240,
+                        caption="DEMO QR — order details only, not a payment QR",
+                    )
+
+                    st.caption(
+                        "Scanning this QR displays order information. "
+                        "It does not open a UPI app or collect money."
+                    )
+
+                elif order["payment_method"] == "UPI ID / UPI App (Demo)":
+                    st.info(
+                        "UPI option selected. In a real integration, "
+                        "this step would connect to a payment provider."
+                    )
+
+                elif order["payment_method"] == "Debit Card (Demo)":
+                    st.info(
+                        "Debit card option selected. Real card details "
+                        "are not requested in this demo."
+                    )
+
+                elif order["payment_method"] == "Credit Card (Demo)":
+                    st.info(
+                        "Credit card option selected. Real card details "
+                        "are not requested in this demo."
+                    )
+
+                if st.button(
+                    "✓ Simulate Successful Payment (Demo)",
+                    key=f"demo_pay_{order['order_id']}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    if mark_demo_payment(order["order_id"]):
+                        st.success(
+                            "Demo payment recorded. No money was transferred."
+                        )
+                        st.rerun()
+                    else:
+                        st.warning(
+                            "This order has already been processed or its "
+                            "status has changed. Refresh and check the order."
+                        )
+
+            elif order["payment_status"] == "Demo Paid":
+                st.warning(
+                    "DEMO PAYMENT COMPLETE — no real money was transferred."
+                )
+                st.success(
+                    "Your order has entered the demo kitchen workflow. "
+                    "Keep your order ID and pickup token."
+                )
+
+            elif order["payment_status"] == "Paid":
+                st.success(
+                    "This order is marked Paid in the saved database. "
+                    "Check the payment record before handing over food."
+                )
+
+            else:
+                st.info(
+                    f"Current payment status: {order['payment_status']}"
+                )
+
+
+# =========================== KITCHEN =========================
 
 with kitchen_tab:
     st.subheader("🖨️ Kitchen Queue")
-    pin = st.text_input("Staff PIN", type="password", key="kitchen_pin")
+
+    pin = st.text_input(
+        "Staff PIN",
+        type="password",
+        key="kitchen_pin",
+    )
 
     if staff_allowed(pin):
         orders = get_orders()
+
         active = [
-            o for o in orders
-            if o["payment_status"] == "Paid"
-            and o["status"] not in ("Collected", "Completed")
+            order for order in orders
+            if order["payment_status"] in ("Paid", "Demo Paid")
+            and order["status"] not in ("Collected", "Completed")
         ]
 
         if not active:
-            st.info("No paid orders waiting in the kitchen.")
+            st.info("No paid or demo-paid orders waiting in the kitchen.")
+
         for order in active:
             with st.container(border=True):
                 a, b, c = st.columns([3, 2, 2])
+
                 a.markdown(f"### 🎫 Token #{order['token']}")
                 a.write(order["order_id"])
                 a.write(order["student_name"])
                 a.caption(f"College ID: {order['student_id']}")
+
                 b.write(order["items"])
                 b.write(f"₹{order['total']:.2f}")
-                b.success("Payment: Paid")
+
+                if order["payment_status"] == "Demo Paid":
+                    b.warning("DEMO PAYMENT — no money transferred")
+                else:
+                    b.success("Payment: Paid")
+
                 c.write(f"**Status: {order['status']}**")
 
                 if order["status"] == "Preparing":
@@ -641,33 +662,49 @@ with kitchen_tab:
                         key=f"ready_{order['order_id']}",
                     ):
                         with db() as conn:
-                            conn.execute("""
-                                UPDATE orders SET status='Ready'
+                            result = conn.execute("""
+                                UPDATE orders
+                                SET status='Ready'
                                 WHERE order_id=?
-                                  AND payment_status='Paid'
+                                  AND payment_status IN ('Paid', 'Demo Paid')
                                   AND status='Preparing'
                             """, (order["order_id"],))
+
+                        if result.rowcount == 1:
+                            st.success("Order marked Ready.")
+                        else:
+                            st.warning(
+                                "Order status changed. Refresh the queue."
+                            )
+
                         st.rerun()
 
                 elif order["status"] == "Ready":
-                    c.info("Waiting for verified pickup at the counter.")
+                    c.info("Waiting for pickup verification.")
 
-        if st.button("Refresh kitchen"):
+        if st.button("🔄 Refresh Kitchen"):
             st.rerun()
 
-# ---------------- PICKUP VERIFICATION ----------------
+
+# ===================== PICKUP VERIFICATION ===================
 
 with pickup_tab:
-    st.subheader("🎟️ Verify student before handing over food")
+    st.subheader("🎟️ Verify Student Before Handing Over Food")
+
     st.caption(
-        "Search the live order record. Do not trust a screenshot as proof."
+        "Search the saved order record. A screenshot alone is not proof "
+        "that an order is eligible for pickup."
     )
 
-    pin = st.text_input("Staff PIN", type="password", key="pickup_pin")
+    pin = st.text_input(
+        "Staff PIN",
+        type="password",
+        key="pickup_pin",
+    )
 
     if staff_allowed(pin):
         search = st.text_input(
-            "Search by order ID, college ID, name or token"
+            "Search by order ID, college ID, name or pickup token"
         ).strip().lower()
 
         all_rows = get_orders()
@@ -681,7 +718,11 @@ with pickup_tab:
                     order["student_name"] or "",
                     str(order["token"]),
                 ]
-                if any(search in str(value).lower() for value in values):
+
+                if any(
+                    search in str(value).lower()
+                    for value in values
+                ):
                     matching.append(order)
 
         if search and not matching:
@@ -689,7 +730,8 @@ with pickup_tab:
 
         for order in matching:
             with st.container(border=True):
-                st.markdown(f"### Token #{order['token']}")
+                st.markdown(f"### 🎫 Token #{order['token']}")
+
                 st.write("**Student:**", order["student_name"])
                 st.write("**College ID:**", order["student_id"])
                 st.write("**Order ID:**", order["order_id"])
@@ -698,13 +740,28 @@ with pickup_tab:
                 st.write("**Payment:**", order["payment_status"])
                 st.write("**Status:**", order["status"])
 
-                if order["payment_status"] != "Paid":
-                    st.error("Payment not verified. Do not hand over food.")
-                elif order["status"] == "Collected":
-                    st.error("Already collected. Do not hand over again.")
+                if order["payment_status"] == "Demo Paid":
+                    st.warning(
+                        "DEMO PAYMENT ONLY — no money was transferred. "
+                        "This is for demonstrating the workflow."
+                    )
+
+                elif order["payment_status"] != "Paid":
+                    st.error(
+                        "Payment is not confirmed. Do not hand over food."
+                    )
+
+                if order["status"] == "Collected":
+                    st.error(
+                        "Already collected. Do not hand over this order again."
+                    )
+
                 elif order["status"] != "Ready":
-                    st.warning("The kitchen has not marked this order Ready.")
-                else:
+                    st.warning(
+                        "The kitchen has not marked this order Ready."
+                    )
+
+                elif order["payment_status"] in ("Paid", "Demo Paid"):
                     confirmed = st.checkbox(
                         "I checked the student's details and token.",
                         key=f"confirm_{order['order_id']}",
@@ -718,16 +775,17 @@ with pickup_tab:
                     ):
                         with db() as conn:
                             result = conn.execute("""
-                                UPDATE orders SET status='Collected'
+                                UPDATE orders
+                                SET status='Collected'
                                 WHERE order_id=?
-                                  AND payment_status='Paid'
+                                  AND payment_status IN ('Paid', 'Demo Paid')
                                   AND status='Ready'
                             """, (order["order_id"],))
 
                         if result.rowcount == 1:
                             st.success(
                                 "Collection recorded. This order cannot "
-                                "be collected a second time."
+                                "be collected a second time through this workflow."
                             )
                             st.rerun()
                         else:
@@ -735,94 +793,181 @@ with pickup_tab:
                                 "Order status changed. Refresh and verify again."
                             )
 
-# ---------------- ADMIN ----------------
+
+# ========================= ADMIN DASHBOARD ===================
 
 with admin_tab:
     st.subheader("⚙️ Admin Dashboard")
-    pin = st.text_input("Admin PIN", type="password", key="admin_pin")
+
+    pin = st.text_input(
+        "Admin PIN",
+        type="password",
+        key="admin_pin",
+    )
 
     if staff_allowed(pin):
         orders = get_orders()
-        total_orders = len(orders)
-        paid_orders = [o for o in orders if o["payment_status"] == "Paid"]
-        revenue = sum(float(o["total"]) for o in paid_orders)
-        ready = sum(o["status"] == "Ready" for o in orders)
-        collected = sum(o["status"] == "Collected" for o in orders)
 
-        m1, m2, m3, m4 = st.columns(4)
+        total_orders = len(orders)
+
+        # Only real Paid records count toward real revenue.
+        paid_orders = [
+            order for order in orders
+            if order["payment_status"] == "Paid"
+        ]
+
+        demo_paid_orders = [
+            order for order in orders
+            if order["payment_status"] == "Demo Paid"
+        ]
+
+        revenue = sum(
+            float(order["total"]) for order in paid_orders
+        )
+
+        ready = sum(
+            order["status"] == "Ready" for order in orders
+        )
+
+        collected = sum(
+            order["status"] == "Collected" for order in orders
+        )
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+
         m1.metric("Total Orders", total_orders)
-        m2.metric("Verified Revenue", f"₹{revenue:.2f}")
-        m3.metric("Ready", ready)
-        m4.metric("Collected", collected)
+        m2.metric("Real Verified Revenue", f"₹{revenue:.2f}")
+        m3.metric("Demo Payments", len(demo_paid_orders))
+        m4.metric("Ready", ready)
+        m5.metric("Collected", collected)
+
+        st.caption(
+            "Demo payments are excluded from real verified revenue."
+        )
 
         st.divider()
-        st.subheader("Menu and Inventory")
+        st.subheader("🍽️ Menu and Inventory")
+
         with db() as conn:
             menu_df = pd.read_sql_query("""
                 SELECT id, name, category, price, stock, active
-                FROM menu ORDER BY category, name
+                FROM menu
+                ORDER BY category, name
             """, conn)
-        st.dataframe(menu_df, use_container_width=True, hide_index=True)
+
+        st.dataframe(
+            menu_df,
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.divider()
-        st.subheader("Order History")
+        st.subheader("📋 Order History")
+
         if orders:
-            export_df = pd.DataFrame([dict(o) for o in orders])
-            st.dataframe(export_df, use_container_width=True, hide_index=True)
+            export_df = pd.DataFrame([
+                dict(order) for order in orders
+            ])
+
+            st.dataframe(
+                export_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
             st.download_button(
                 "⬇️ Download Order Report (CSV)",
                 export_df.to_csv(index=False).encode("utf-8"),
                 "campusbites_orders.csv",
                 "text/csv",
             )
+        else:
+            st.info("No orders have been created yet.")
 
         st.divider()
-        st.subheader("High-Traffic Demo Test")
+        st.subheader("🔥 High-Traffic Demo Test")
+
         st.caption(
-            "Creates clearly labelled unpaid demo records. "
-            "They are not real paid orders and will not enter the kitchen queue."
+            "Creates 100 clearly labelled unpaid demo records. "
+            "These do not enter the kitchen queue or count as revenue."
         )
 
-        if st.button("🔥 Generate 100 Demo Orders"):
+        if st.button("Generate 100 Demo Orders"):
             with db() as conn:
-                for i in range(100):
-                    token = conn.execute(
+                for _ in range(100):
+                    token_row = conn.execute(
                         "SELECT value FROM settings WHERE key='token_counter'"
                     ).fetchone()
-                    number = int(token["value"]) + 1
+
+                    number = int(token_row["value"]) + 1
+
                     conn.execute(
                         "UPDATE settings SET value=? WHERE key='token_counter'",
                         (str(number),),
                     )
+
                     demo_id = f"DEMO-{uuid.uuid4().hex[:10].upper()}"
+
                     conn.execute("""
                         INSERT INTO orders(
                             order_id, token, student_name, student_id,
                             items, total, gateway_fee, net_amount,
-                            status, payment_status, created_at
+                            status, payment_status, created_at,
+                            payment_method
                         )
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        demo_id, number, "Demo Student", "DEMO-ID",
-                        "Crispy Samosa x1", 31.00, 0.00, 31.00,
-                        "Demo", "Demo - Unpaid",
-                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        demo_id,
+                        number,
+                        "Demo Student",
+                        "DEMO-ID",
+                        "Crispy Samosa x1",
+                        31.00,
+                        0.00,
+                        31.00,
+                        "Demo",
+                        "Demo - Unpaid",
+                        datetime.datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                        "Stress Test (Demo)",
                     ))
+
             st.success("100 unpaid demo records created.")
             st.rerun()
 
+        st.divider()
+        st.subheader("♻️ Reset Demo Orders")
+
         with st.expander("Reset all order data"):
-            st.warning("This permanently deletes the saved order history.")
-            confirm = st.checkbox("I understand this deletes all orders.")
-            if st.button("♻️ Reset Orders", disabled=not confirm):
+            st.warning(
+                "This permanently deletes saved order history, including "
+                "student orders and stress-test records."
+            )
+
+            confirm = st.checkbox(
+                "I understand this deletes all saved orders."
+            )
+
+            if st.button(
+                "Reset Orders",
+                disabled=not confirm,
+            ):
                 reset_demo()
+
                 st.session_state.cart = []
-                st.session_state.pop("last_order_id", None)
-                st.session_state.pop("payment_url", None)
+                st.session_state.last_order_id = None
+
+                st.success("Order data has been reset.")
                 st.rerun()
 
+
+# ============================ FOOTER =========================
+
 st.divider()
+
 st.caption(
-    "CampusBites · Razorpay checkout · Server-side payment checks · "
-    "Unique tokens · One-time pickup verification"
+    "CampusBites · Demo-only QR and payment simulation · "
+    "Unique pickup tokens · One-time pickup workflow · "
+    "No real money collected"
 )
