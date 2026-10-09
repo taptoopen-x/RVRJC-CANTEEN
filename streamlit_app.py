@@ -58,13 +58,44 @@ def init_db():
                 college_id TEXT NOT NULL,
                 items_json TEXT NOT NULL,
                 total REAL NOT NULL,
-                payment_method TEXT NOT NULL,
+                payment_method TEXT NOT NULL DEFAULT 'Pay at counter (Cash)',
                 status TEXT NOT NULL DEFAULT 'Placed',
-                created_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '',
                 collected_at TEXT
             )
             """
         )
+
+        # Safely add columns that may be missing from an older SQLite table.
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        migrations = {
+            "order_token": "TEXT",
+            "student_name": "TEXT NOT NULL DEFAULT ''",
+            "college_id": "TEXT NOT NULL DEFAULT ''",
+            "items_json": "TEXT NOT NULL DEFAULT '[]'",
+            "total": "REAL NOT NULL DEFAULT 0",
+            "payment_method": "TEXT NOT NULL DEFAULT 'Pay at counter (Cash)'",
+            "status": "TEXT NOT NULL DEFAULT 'Placed'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "collected_at": "TEXT",
+        }
+        for column_name, column_definition in migrations.items():
+            if column_name not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE orders ADD COLUMN {column_name} {column_definition}"
+                )
+
+        # Populate missing tokens on older rows before new orders are created.
+        rows_without_token = conn.execute(
+            "SELECT id FROM orders WHERE order_token IS NULL OR order_token = ''"
+        ).fetchall()
+        for row in rows_without_token:
+            conn.execute(
+                "UPDATE orders SET order_token=? WHERE id=?",
+                (uuid.uuid4().hex[:6].upper(), row["id"]),
+            )
         conn.commit()
 
     # Small, editable starter menu. Seed only when the menu is empty.
