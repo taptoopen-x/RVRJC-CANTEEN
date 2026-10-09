@@ -1,3 +1,4 @@
+
 import streamlit as st
 import sqlite3
 import qrcode
@@ -19,7 +20,6 @@ st.set_page_config(
 
 DB_PATH = Path(__file__).parent / "campusbites.db"
 
-# Change these PINs before sharing the app publicly.
 STAFF_PIN = st.secrets.get("app", {}).get("staff_pin", "1234")
 
 DEFAULT_MENU = [
@@ -69,10 +69,11 @@ def initialize_db():
             )
         """)
 
-        # Add newer columns if an older database already exists.
         columns = {
             row["name"]
-            for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+            for row in conn.execute(
+                "PRAGMA table_info(orders)"
+            ).fetchall()
         }
 
         migrations = {
@@ -90,7 +91,9 @@ def initialize_db():
                     f"ALTER TABLE orders ADD COLUMN {column} {definition}"
                 )
 
-        count = conn.execute("SELECT COUNT(*) FROM menu").fetchone()[0]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM menu"
+        ).fetchone()[0]
 
         if count == 0:
             conn.executemany(
@@ -179,11 +182,16 @@ def create_order_qr(order):
     """Create a QR containing readable demo order details."""
     items = json.loads(order["items"])
 
-    item_lines = []
-    for item in items:
-        item_lines.append(
-            f'{item["name"]} x {item["quantity"]}'
-        )
+    item_lines = [
+        f'{item["name"]} x {item["quantity"]}'
+        for item in items
+    ]
+
+    subtotal = sum(
+        float(item["price"]) * int(item["quantity"])
+        for item in items
+    )
+    fee = float(order["total"]) - subtotal
 
     qr_text = "\n".join([
         "CAMPUSBITES - DEMO ORDER",
@@ -194,7 +202,10 @@ def create_order_qr(order):
         f'Pickup Token: {order["token"]}',
         "Items:",
         *item_lines,
-        f'AMOUNT: INR {float(order["total"]):.2f}',
+        f"Food subtotal: INR {subtotal:.2f}",
+        f"Demo service fee: INR {fee:.2f}",
+        f'AMOUNT TO PAY: INR {float(order["total"]):.2f}',
+        f'Order status: {order["status"]}',
         "Payment is simulated. No money transferred."
     ])
 
@@ -307,32 +318,40 @@ with tab_order:
         if not menu_rows:
             st.warning("No menu items are available.")
         else:
-            for item in menu_rows:
-                row1, row2 = st.columns([3, 1])
-                row1.write(f'**{item["name"]}**')
-                row1.caption(item["category"])
-                row2.write(money(item["price"]))
+            # Display menu items in two columns.
+            for start in range(0, len(menu_rows), 2):
+                menu_cols = st.columns(2, gap="small")
 
-                key = f'qty_{item["id"]}'
-                if key not in st.session_state:
-                    st.session_state[key] = 0
+                for col, item in zip(
+                    menu_cols, menu_rows[start:start + 2]
+                ):
+                    with col:
+                        with st.container(border=True):
+                            st.markdown(f'**{item["name"]}**')
+                            st.caption(item["category"])
+                            st.write(money(item["price"]))
 
-                st.number_input(
-                    f'Quantity — {item["name"]}',
-                    min_value=0,
-                    max_value=20,
-                    step=1,
-                    key=key,
-                    label_visibility="collapsed"
-                )
-                st.divider()
+                            key = f'qty_{item["id"]}'
+                            if key not in st.session_state:
+                                st.session_state[key] = 0
+
+                            st.number_input(
+                                f'Quantity — {item["name"]}',
+                                min_value=0,
+                                max_value=20,
+                                step=1,
+                                key=key,
+                                label_visibility="collapsed"
+                            )
 
     with right:
         st.markdown("#### Your basket")
 
         basket = []
         for item in menu_rows:
-            quantity = int(st.session_state.get(f'qty_{item["id"]}', 0))
+            quantity = int(
+                st.session_state.get(f'qty_{item["id"]}', 0)
+            )
             if quantity > 0:
                 basket.append({
                     "name": item["name"],
@@ -415,7 +434,10 @@ with tab_order:
                 st.write(f'**Amount:** {money(order["total"])}')
                 st.write(f'**College ID:** {order["student_id"]}')
 
-                if payment_method == "Demo QR" or order["payment_method"] == "Demo QR":
+                if (
+                    payment_method == "Demo QR"
+                    or order["payment_method"] == "Demo QR"
+                ):
                     st.image(
                         create_order_qr(order),
                         caption="Scan to view order details and amount",
