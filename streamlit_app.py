@@ -49,6 +49,8 @@ def init_db():
             )
             """
         )
+
+        # Use the current expected schema for new databases.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
@@ -66,9 +68,10 @@ def init_db():
             """
         )
 
-        # Safely add columns that may be missing from an older SQLite table.
-        existing_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+        # Migrate older databases without deleting existing orders.
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(orders)").fetchall()
         }
         migrations = {
             "order_token": "TEXT",
@@ -82,23 +85,34 @@ def init_db():
             "collected_at": "TEXT",
         }
         for column_name, column_definition in migrations.items():
-            if column_name not in existing_columns:
+            if column_name not in columns:
                 conn.execute(
                     f"ALTER TABLE orders ADD COLUMN {column_name} {column_definition}"
                 )
 
-        # Populate missing tokens on older rows before new orders are created.
-        rows_without_token = conn.execute(
-            "SELECT id FROM orders WHERE order_token IS NULL OR order_token = ''"
+        # Repair missing/duplicate tokens from older rows before the unique index.
+        existing_rows = conn.execute(
+            "SELECT id, order_token FROM orders ORDER BY id"
         ).fetchall()
-        for row in rows_without_token:
-            conn.execute(
-                "UPDATE orders SET order_token=? WHERE id=?",
-                (uuid.uuid4().hex[:6].upper(), row["id"]),
-            )
+        seen_tokens = set()
+        for row in existing_rows:
+            token = (row["order_token"] or "").strip().upper()
+            if not token or token in seen_tokens:
+                token = uuid.uuid4().hex[:6].upper()
+                while token in seen_tokens:
+                    token = uuid.uuid4().hex[:6].upper()
+                conn.execute(
+                    "UPDATE orders SET order_token=? WHERE id=?",
+                    (token, row["id"]),
+                )
+            seen_tokens.add(token)
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_token ON orders(order_token)"
+        )
         conn.commit()
 
-    # Small, editable starter menu. Seed only when the menu is empty.
+    # Seed a starter menu only if the menu is empty.
     with get_connection() as conn:
         count = conn.execute("SELECT COUNT(*) FROM menu").fetchone()[0]
         if count == 0:
@@ -163,28 +177,40 @@ def delete_menu_item(item_id):
 
 
 def create_order(student_name, college_id, items, total, payment_method):
-    token = uuid.uuid4().hex[:6].upper()
     now = datetime.now().isoformat(timespec="seconds")
+    items_json = pd.DataFrame(items).to_json(orient="records")
     with get_connection() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO orders
-            (order_token, student_name, college_id, items_json, total, payment_method, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'Placed', ?)
-            """,
-            (
-                token,
-                student_name.strip(),
-                college_id.strip(),
-                pd.Series(items).to_json(orient="records"),
-                float(total),
-                payment_method,
-                now,
-            ),
-        )
-        order_id = cur.lastrowid
-        conn.commit()
-    return order_id, token
+        # Retry token generation if a rare collision occurs.
+        for _ in range(10):
+            token = uuid.uuid4().hex[:6].upper()
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO orders
+                    (order_token, student_name, college_id, items_json, total,
+                     payment_method, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        token,
+                        student_name.strip(),
+                        college_id.strip(),
+                        items_json,
+                        float(total),
+                        payment_method,
+                        "Placed",
+                        now,
+                    ),
+                )
+                conn.commit()
+                return cur.lastrowid, token
+            except sqlite3.IntegrityError as exc:
+                conn.rollback()
+                # Only retry collisions in the unique order token.
+                if "order_token" in str(exc).lower() or "unique constraint" in str(exc).lower():
+                    continue
+                raise
+        raise sqlite3.IntegrityError("Could not generate a unique order token. Please retry.")
 
 
 def get_orders():
