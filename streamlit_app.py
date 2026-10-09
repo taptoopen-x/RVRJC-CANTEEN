@@ -15,7 +15,7 @@ import streamlit as st
 # ============================================================
 
 APP_TITLE = "CampusBites"
-DB_PATH = os.environ.get("CAMPUSBITES_DB", "campusbites_v2.db")
+DB_PATH = os.environ.get("CAMPUSBITES_DB", "campusbites_v4.db")
 DEMO_UPI_ID = "demo-canteen@upi"  # Placeholder only; replace with a real merchant UPI ID.
 MERCHANT_NAME = "RVRJC Canteen (DEMO)"
 CATEGORIES = ["Snacks", "Meals", "Drinks", "Desserts", "Other"]
