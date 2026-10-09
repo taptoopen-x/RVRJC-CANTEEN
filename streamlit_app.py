@@ -2,636 +2,598 @@
 import streamlit as st
 import sqlite3
 import qrcode
-import pandas as pd
 import json
 import uuid
 from io import BytesIO
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-# ==========================================================
-# CAMPUSBITES - RVR & JC COLLEGE OF ENGINEERING
-# Demo ordering, pickup QR, kitchen queue and admin
-# ==========================================================
+# ---------------- PAGE CONFIG ----------------
 
 st.set_page_config(
     page_title="CampusBites | RVRJC",
-    page_icon="🍽️",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+    page_icon="🍔",
+    layout="wide"
 )
 
 DB_PATH = Path(__file__).parent / "campusbites.db"
 
-DEFAULT_MENU = [
-    ("Hot Crispy Dosa", 35, "Breakfast"),
-    ("Steaming Soft Idli (Plate)", 30, "Breakfast"),
-    ("Special Filter Coffee", 15, "Drinks"),
-    ("Chai / Tea", 12, "Drinks"),
-    ("Crispy Samosa (Plate)", 30, "Snacks"),
-]
+# ---------------- MENU ----------------
 
-PAYMENT_METHODS = [
-    "UPI at counter",
-    "Card at counter",
-    "Cash at counter",
+DEFAULT_MENU = [
+    {"name": "Veg Sandwich", "price": 40, "category": "Snacks"},
+    {"name": "Veg Burger", "price": 60, "category": "Snacks"},
+    {"name": "French Fries", "price": 50, "category": "Snacks"},
+    {"name": "Samosa", "price": 15, "category": "Snacks"},
+    {"name": "Veg Fried Rice", "price": 70, "category": "Meals"},
+    {"name": "Veg Noodles", "price": 70, "category": "Meals"},
+    {"name": "Chicken Fried Rice", "price": 100, "category": "Meals"},
+    {"name": "Tea", "price": 10, "category": "Drinks"},
+    {"name": "Coffee", "price": 15, "category": "Drinks"},
+    {"name": "Lime Juice", "price": 25, "category": "Drinks"},
 ]
 
 # ---------------- DATABASE ----------------
 
-def connect_db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_connection():
+    return sqlite3.connect(DB_PATH)
 
-
-def initialize_db():
-    with connect_db() as conn:
+def initialize_database():
+    with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS menu (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                name TEXT UNIQUE NOT NULL,
                 price REAL NOT NULL,
-                category TEXT DEFAULT 'Food',
-                active INTEGER DEFAULT 1
+                category TEXT NOT NULL,
+                available INTEGER DEFAULT 1
             )
         """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                token INTEGER,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT UNIQUE NOT NULL,
+                token TEXT UNIQUE NOT NULL,
                 student_name TEXT NOT NULL,
-                student_id TEXT NOT NULL,
+                college_id TEXT NOT NULL,
                 items TEXT NOT NULL,
                 total REAL NOT NULL,
-                gateway_fee REAL DEFAULT 0,
-                net_amount REAL DEFAULT 0,
-                status TEXT DEFAULT 'Preparing',
-                payment_status TEXT DEFAULT 'Pay at counter',
-                created_at TEXT,
-                razorpay_link_id TEXT,
-                payment_id TEXT,
-                payment_method TEXT DEFAULT 'UPI at counter'
+                payment_method TEXT NOT NULL,
+                payment_status TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
 
-        columns = {
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info(orders)"
-            ).fetchall()
-        }
-
-        migrations = {
-            "token": "INTEGER",
-            "gateway_fee": "REAL DEFAULT 0",
-            "net_amount": "REAL DEFAULT 0",
-            "razorpay_link_id": "TEXT",
-            "payment_id": "TEXT",
-            "payment_method": "TEXT DEFAULT 'UPI at counter'",
-        }
-
-        for column, definition in migrations.items():
-            if column not in columns:
-                conn.execute(
-                    f"ALTER TABLE orders ADD COLUMN {column} {definition}"
-                )
-
-        menu_count = conn.execute(
+        count = conn.execute(
             "SELECT COUNT(*) FROM menu"
         ).fetchone()[0]
 
-        if menu_count == 0:
+        if count == 0:
             conn.executemany(
-                """INSERT INTO menu (name, price, category, active)
+                """INSERT INTO menu
+                   (name, price, category, available)
                    VALUES (?, ?, ?, 1)""",
-                DEFAULT_MENU
+                [
+                    (item["name"], item["price"], item["category"])
+                    for item in DEFAULT_MENU
+                ]
             )
 
-
-initialize_db()
-
-# ---------------- HELPERS ----------------
-
-def money(amount):
-    return f"₹{float(amount):.2f}"
-
-
 def get_menu():
-    with connect_db() as conn:
-        return conn.execute("""
-            SELECT * FROM menu
-            WHERE active = 1
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, name, price, category
+            FROM menu
+            WHERE available = 1
             ORDER BY category, name
         """).fetchall()
 
+    return [
+        {
+            "id": row[0],
+            "name": row[1],
+            "price": float(row[2]),
+            "category": row[3]
+        }
+        for row in rows
+    ]
 
 def get_orders():
-    with connect_db() as conn:
+    with get_connection() as conn:
         return conn.execute("""
-            SELECT * FROM orders
-            ORDER BY created_at DESC
+            SELECT id, order_id, token, student_name,
+                   college_id, items, total, payment_method,
+                   payment_status, status, created_at
+            FROM orders
+            ORDER BY id DESC
         """).fetchall()
 
-
-def get_order(order_id):
-    with connect_db() as conn:
-        return conn.execute(
-            "SELECT * FROM orders WHERE order_id = ?",
-            (order_id,)
-        ).fetchone()
-
-
-def normalize_id(value):
-    return str(value or "").strip().upper()
-
-
-def get_items_text(order):
-    try:
-        items = json.loads(order["items"])
-        return ", ".join(
-            f'{item["name"]} x {item["quantity"]}'
-            for item in items
+def update_order_status(order_id, new_status):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE orders SET status = ? WHERE order_id = ?",
+            (new_status, order_id)
         )
-    except (ValueError, TypeError, KeyError):
-        return str(order["items"])
 
+initialize_database()
 
-def create_order(name, college_id, basket, payment_method):
-    subtotal = sum(
-        float(item["price"]) * int(item["quantity"])
-        for item in basket
+# ---------------- SESSION STATE ----------------
+
+if "cart_version" not in st.session_state:
+    st.session_state.cart_version = 0
+
+if "last_order" not in st.session_state:
+    st.session_state.last_order = None
+
+if "notice" not in st.session_state:
+    st.session_state.notice = None
+
+# ---------------- QR CODE ----------------
+
+def create_qr(order_data):
+    qr_content = {
+        "order_id": order_data["order_id"],
+        "pickup_token": order_data["token"],
+        "student_name": order_data["student_name"],
+        "college_id": order_data["college_id"],
+        "items": order_data["items"],
+        "total_inr": order_data["total"],
+        "payment_method": order_data["payment_method"],
+        "payment_status": order_data["payment_status"],
+        "note": (
+            "Order receipt only. Pay at the canteen counter. "
+            "Staff must verify the physical college ID."
+        )
+    }
+
+    qr = qrcode.QRCode(
+        version=1,
+        box_size=8,
+        border=3
+    )
+    qr.add_data(json.dumps(qr_content, ensure_ascii=False))
+    qr.make(fit=True)
+
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+# ---------------- CREATE ORDER ----------------
+
+def place_order(student_name, college_id, payment_method, cart):
+    order_id = "CB-" + uuid.uuid4().hex[:8].upper()
+    token = uuid.uuid4().hex[:6].upper()
+
+    total = sum(
+        item["price"] * item["quantity"]
+        for item in cart
     )
 
-    # Demo service fee, not a payment gateway fee.
-    fee = 1.00
-    total = subtotal + fee
-    order_id = "CB-" + uuid.uuid4().hex[:8].upper()
+    items_json = json.dumps(cart)
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with connect_db() as conn:
-        last_token = conn.execute(
-            "SELECT COALESCE(MAX(token), 100) FROM orders"
-        ).fetchone()[0]
-
-        token = int(last_token or 100) + 1
-
+    with get_connection() as conn:
         conn.execute("""
             INSERT INTO orders (
-                order_id, token, student_name, student_id, items,
-                total, gateway_fee, net_amount, status,
-                payment_status, created_at, payment_method
+                order_id, token, student_name, college_id,
+                items, total, payment_method, payment_status,
+                status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             order_id,
             token,
-            name.strip(),
-            normalize_id(college_id),
-            json.dumps(basket),
+            student_name.strip(),
+            college_id.strip(),
+            items_json,
             total,
-            fee,
-            subtotal,
-            "Preparing",
+            payment_method,
             "Pay at counter",
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            payment_method
+            "Preparing",
+            created_at
         ))
 
-    return order_id
+    return {
+        "order_id": order_id,
+        "token": token,
+        "student_name": student_name.strip(),
+        "college_id": college_id.strip(),
+        "items": cart,
+        "total": total,
+        "payment_method": payment_method,
+        "payment_status": "Pay at counter",
+        "status": "Preparing",
+        "created_at": created_at
+    }
 
-
-def make_pickup_qr(order):
-    """QR shows order information. It does not transfer money."""
-    items = json.loads(order["items"])
-
-    item_lines = [
-        f'{item["name"]} x {item["quantity"]}'
-        for item in items
-    ]
-
-    qr_text = "\n".join([
-        "CAMPUSBITES - PICKUP RECEIPT",
-        f'Order ID: {order["order_id"]}',
-        f'Pickup Token: {order["token"]}',
-        f'Name: {order["student_name"]}',
-        f'College ID: {order["student_id"]}',
-        "Items:",
-        *item_lines,
-        f'AMOUNT: INR {float(order["total"]):.2f}',
-        f'Payment choice: {order["payment_method"]}',
-        f'Status: {order["status"]}',
-        "Pay at canteen counter.",
-        "Staff must check the physical college ID."
-    ])
-
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=7,
-        border=3
-    )
-    qr.add_data(qr_text)
-    qr.make(fit=True)
-
-    image = qr.make_image(
-        fill_color="black",
-        back_color="white"
-    )
-
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def set_status(order_id, status):
-    with connect_db() as conn:
-        conn.execute(
-            "UPDATE orders SET status = ? WHERE order_id = ?",
-            (status, order_id)
-        )
-
-
-# ---------------- DESIGN ----------------
+# ---------------- STYLING ----------------
 
 st.markdown("""
 <style>
     .block-container {
-        padding-top: 0.6rem;
-        padding-bottom: 1rem;
-        max-width: 1300px;
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
     }
-    h1, h2, h3 {
-        letter-spacing: -0.4px;
-        margin-bottom: 0.4rem;
+    .food-card {
+        border: 1px solid #dddddd;
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 10px;
     }
-    div.stButton > button {
-        width: 100%;
-        min-height: 38px;
-        border-radius: 9px;
-        font-weight: 600;
-    }
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,0.25);
-        padding: 10px;
-        border-radius: 10px;
-    }
-    div[data-testid="stTabs"] button {
-        font-weight: 600;
+    .small-muted {
+        color: #777777;
+        font-size: 0.9rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🍽️ CampusBites")
-st.caption("RVR & JC College of Engineering · Smart Canteen")
+# ---------------- HEADER ----------------
 
-st.info(
-    "Order food → collect your QR/token → show your physical college ID "
-    "to staff. Payment is handled separately at the counter."
-)
+st.title("🍔 CampusBites")
+st.caption("RVRJC College Canteen Ordering System")
 
-tab_order, tab_kitchen, tab_admin = st.tabs([
+if st.session_state.notice:
+    st.success(st.session_state.notice)
+    st.session_state.notice = None
+
+order_tab, kitchen_tab, admin_tab = st.tabs([
     "🛒 Order Food",
     "👨‍🍳 Kitchen & Pickup",
     "📊 Admin"
 ])
 
-# ==========================================================
-# 1. STUDENT ORDER
-# ==========================================================
+# ==================================================
+# ORDER FOOD
+# ==================================================
 
-with tab_order:
-    st.subheader("Today's menu")
+with order_tab:
+    st.subheader("Place your order")
+    st.write("Choose your food, enter your student details, and submit.")
 
-    menu_rows = get_menu()
+    menu = get_menu()
 
-    left, right = st.columns([1.15, 0.85], gap="small")
+    if not menu:
+        st.warning("No food items are currently available.")
+    else:
+        with st.form(
+            key=f"order_form_{st.session_state.cart_version}"
+        ):
+            st.markdown("### 🍽️ Menu")
 
-    with left:
-        if not menu_rows:
-            st.warning("No food items available.")
-        else:
-            # Two menu cards per row to reduce scrolling.
-            for start in range(0, len(menu_rows), 2):
-                cols = st.columns(2, gap="small")
+            cart = []
+            categories = list(dict.fromkeys(
+                item["category"] for item in menu
+            ))
 
-                for col, item in zip(
-                    cols, menu_rows[start:start + 2]
-                ):
-                    with col:
-                        with st.container(border=True):
-                            st.markdown(f'**{item["name"]}**')
-                            st.caption(item["category"])
-                            st.write(money(item["price"]))
+            for category in categories:
+                st.markdown(f"#### {category}")
 
-                            quantity_key = f'qty_{item["id"]}'
+                category_items = [
+                    item for item in menu
+                    if item["category"] == category
+                ]
 
-                            if quantity_key not in st.session_state:
-                                st.session_state[quantity_key] = 0
+                columns = st.columns(2)
 
-                            st.number_input(
-                                "Quantity",
-                                min_value=0,
-                                max_value=20,
-                                step=1,
-                                key=quantity_key
+                for index, item in enumerate(category_items):
+                    with columns[index % 2]:
+                        st.markdown(
+                            f"**{item['name']}**  \n"
+                            f"₹{item['price']:.2f}"
+                        )
+
+                        quantity = st.number_input(
+                            f"Quantity — {item['name']}",
+                            min_value=0,
+                            max_value=20,
+                            value=0,
+                            step=1,
+                            key=(
+                                f"qty_{st.session_state.cart_version}_"
+                                f"{item['id']}"
                             )
+                        )
 
-    with right:
-        st.subheader("Your basket")
+                        if quantity > 0:
+                            cart.append({
+                                "id": item["id"],
+                                "name": item["name"],
+                                "price": item["price"],
+                                "quantity": int(quantity)
+                            })
 
-        basket = []
+            st.markdown("---")
+            st.markdown("### 🎓 Student details")
 
-        for item in menu_rows:
-            quantity = int(
-                st.session_state.get(f'qty_{item["id"]}', 0)
+            student_name = st.text_input(
+                "Student name",
+                key=f"name_{st.session_state.cart_version}"
             )
 
-            if quantity > 0:
-                basket.append({
-                    "name": item["name"],
-                    "price": float(item["price"]),
-                    "quantity": quantity
-                })
+            college_id = st.text_input(
+                "College ID",
+                key=f"college_{st.session_state.cart_version}"
+            )
 
-        subtotal = sum(
-            item["price"] * item["quantity"]
-            for item in basket
-        )
-        fee = 1.00 if basket else 0.00
-        total = subtotal + fee
+            payment_method = st.selectbox(
+                "Payment option",
+                [
+                    "UPI at counter",
+                    "Card at counter",
+                    "Cash at counter"
+                ],
+                key=f"payment_{st.session_state.cart_version}"
+            )
 
-        if basket:
-            for item in basket:
-                st.write(
-                    f'{item["name"]} × {item["quantity"]} — '
-                    f'{money(item["price"] * item["quantity"])}'
-                )
-        else:
-            st.caption("Choose food from the menu.")
+            total = sum(
+                item["price"] * item["quantity"]
+                for item in cart
+            )
 
-        st.divider()
-        st.write(f"Food subtotal: **{money(subtotal)}**")
-        st.write(f"Service fee: **{money(fee)}**")
-        st.markdown(f"### Total: {money(total)}")
+            st.markdown(f"### Total: ₹{total:.2f}")
 
-        st.subheader("Student details")
+            submitted = st.form_submit_button(
+                "Place Order",
+                type="primary",
+                use_container_width=True
+            )
 
-        student_name = st.text_input(
-            "Student name",
-            key="student_name",
-            placeholder="Enter your name"
-        )
-
-        student_id = st.text_input(
-            "College ID",
-            key="student_id",
-            placeholder="Enter your college ID"
-        )
-
-        payment_method = st.selectbox(
-            "Payment method",
-            PAYMENT_METHODS
-        )
-
-        st.caption(
-            "These are payment preferences only. UPI and card payments "
-            "are not processed by this demo."
-        )
-
-        if st.button("Place Order", type="primary"):
-            if not basket:
+        if submitted:
+            if not student_name.strip():
+                st.error("Please enter your student name.")
+            elif not college_id.strip():
+                st.error("Please enter your college ID.")
+            elif not cart:
                 st.error("Please select at least one food item.")
-            elif not student_name.strip():
-                st.error("Enter your name.")
-            elif not student_id.strip():
-                st.error("Enter your college ID.")
             else:
-                new_id = create_order(
-                    student_name,
-                    student_id,
-                    basket,
-                    payment_method
-                )
+                try:
+                    order_data = place_order(
+                        student_name,
+                        college_id,
+                        payment_method,
+                        cart
+                    )
 
-                st.session_state["last_order_id"] = new_id
+                    st.session_state.last_order = order_data
 
-                # Clear the basket quantities after successful order creation.
-                for item in menu_rows:
-                    st.session_state[f'qty_{item["id"]}'] = 0
+                    # Create new widget keys on the next run.
+                    # Do NOT assign to existing quantity widget keys.
+                    st.session_state.cart_version += 1
 
-                st.rerun()
-
-        # Show the last receipt.
-        last_id = st.session_state.get("last_order_id")
-
-        if last_id:
-            order = get_order(last_id)
-
-            if order:
-                st.divider()
-                st.subheader("Your pickup receipt")
-
-                st.success(f'Pickup token: {order["token"]}')
-                st.write(f'**Student:** {order["student_name"]}')
-                st.write(f'**College ID:** {order["student_id"]}')
-                st.write(f'**Order:** {order["order_id"]}')
-                st.write(f'**Food:** {get_items_text(order)}')
-                st.write(f'**Amount:** {money(order["total"])}')
-                st.write(f'**Status:** {order["status"]}')
-                st.write(f'**Payment choice:** {order["payment_method"]}')
-
-                qr_image = make_pickup_qr(order)
-
-                st.image(
-                    qr_image,
-                    width=210,
-                    caption="Scan for order details and amount"
-                )
-
-                st.download_button(
-                    "Download pickup QR",
-                    data=qr_image,
-                    file_name=f'{order["order_id"]}_QR.png',
-                    mime="image/png"
-                )
-
-                receipt = "\n".join([
-                    "CAMPUSBITES - PICKUP RECEIPT",
-                    f'Order: {order["order_id"]}',
-                    f'Token: {order["token"]}',
-                    f'Name: {order["student_name"]}',
-                    f'College ID: {order["student_id"]}',
-                    f'Food: {get_items_text(order)}',
-                    f'Amount: {money(order["total"])}',
-                    f'Payment choice: {order["payment_method"]}',
-                    f'Status: {order["status"]}',
-                    "Pay at counter. Show physical college ID."
-                ])
-
-                st.download_button(
-                    "Download receipt to print",
-                    data=receipt,
-                    file_name=f'{order["order_id"]}_receipt.txt',
-                    mime="text/plain"
-                )
-
-                if order["status"] == "Collected":
-                    st.success("Previous order collected. You can order again.")
-
-                if st.button("New Order", key="new_order"):
-                    st.session_state.pop("last_order_id", None)
-                    st.session_state["student_name"] = ""
-                    st.session_state["student_id"] = ""
-                    for item in menu_rows:
-                        st.session_state[f'qty_{item["id"]}'] = 0
+                    st.session_state.notice = (
+                        f"Order placed successfully! "
+                        f"Pickup token: {order_data['token']}"
+                    )
                     st.rerun()
 
-# ==========================================================
-# 2. KITCHEN AND PICKUP - NO PIN
-# ==========================================================
+                except Exception as error:
+                    st.error(f"Could not place the order: {error}")
 
-with tab_kitchen:
-    st.subheader("Kitchen & pickup")
+    # Show the most recently placed order
+    last_order = st.session_state.last_order
+
+    if last_order:
+        st.markdown("---")
+        st.subheader("✅ Your order receipt")
+
+        st.write(f"**Order ID:** {last_order['order_id']}")
+        st.write(f"**Pickup token:** {last_order['token']}")
+        st.write(f"**Student:** {last_order['student_name']}")
+        st.write(f"**College ID:** {last_order['college_id']}")
+        st.write(f"**Status:** {last_order['status']}")
+
+        st.markdown("#### Items")
+        for item in last_order["items"]:
+            line_total = item["price"] * item["quantity"]
+            st.write(
+                f"- {item['name']} × {item['quantity']} "
+                f"— ₹{line_total:.2f}"
+            )
+
+        st.markdown(f"### Total: ₹{last_order['total']:.2f}")
+        st.write(f"**Payment option:** {last_order['payment_method']}")
+        st.info(
+            "This QR is an order receipt, not a payment QR. "
+            "Pay at the counter. Staff must verify your physical "
+            "college ID and pickup token."
+        )
+
+        qr_buffer = create_qr(last_order)
+
+        st.image(qr_buffer, width=250)
+
+        st.download_button(
+            "Download Order QR",
+            data=qr_buffer.getvalue(),
+            file_name=f"{last_order['order_id']}_qr.png",
+            mime="image/png"
+        )
+
+        receipt_text = (
+            f"CampusBites - RVRJC\n"
+            f"Order ID: {last_order['order_id']}\n"
+            f"Pickup token: {last_order['token']}\n"
+            f"Student: {last_order['student_name']}\n"
+            f"College ID: {last_order['college_id']}\n"
+            + "".join(
+                f"{item['name']} x {item['quantity']} = "
+                f"₹{item['price'] * item['quantity']:.2f}\n"
+                for item in last_order["items"]
+            )
+            + f"Total: ₹{last_order['total']:.2f}\n"
+            + f"Payment: {last_order['payment_method']}\n"
+            + "Pay at the canteen counter.\n"
+        )
+
+        st.download_button(
+            "Download Text Receipt",
+            data=receipt_text,
+            file_name=f"{last_order['order_id']}_receipt.txt",
+            mime="text/plain"
+        )
+
+# ==================================================
+# KITCHEN & PICKUP
+# ==================================================
+
+with kitchen_tab:
+    st.subheader("Kitchen queue & pickup verification")
     st.caption(
-        "Staff: prepare the order, mark it Ready, then check the student's "
-        "physical college ID and pickup token before handing over food."
+        "Demo mode: staff should physically verify the student's "
+        "college ID and pickup token."
     )
 
-    orders = get_orders()
+    if st.button("Refresh Orders"):
+        st.rerun()
 
+    orders = get_orders()
     active_orders = [
         order for order in orders
-        if order["status"] in ("Preparing", "Ready")
+        if order[9] in ("Preparing", "Ready")
     ]
 
     if not active_orders:
-        st.info("No active orders.")
+        st.info("There are no active orders.")
     else:
         for order in active_orders:
+            (
+                db_id, order_id, token, name, college_id,
+                items_json, total, payment_method,
+                payment_status, status, created_at
+            ) = order
+
             with st.container(border=True):
-                st.markdown(
-                    f'### Token {order["token"]} · {order["student_name"]}'
-                )
-                st.write(f'**College ID:** {order["student_id"]}')
-                st.write(f'**Order ID:** {order["order_id"]}')
-                st.write(f'**Food:** {get_items_text(order)}')
-                st.write(f'**Amount:** {money(order["total"])}')
-                st.write(f'**Payment choice:** {order["payment_method"]}')
-                st.write(f'**Status:** {order["status"]}')
+                st.markdown(f"### {order_id}")
+                st.write(f"**Student:** {name}")
+                st.write(f"**College ID:** {college_id}")
+                st.write(f"**Pickup token:** `{token}`")
+                st.write(f"**Status:** {status}")
+                st.write(f"**Total:** ₹{total:.2f}")
 
-                if order["status"] == "Preparing":
+                try:
+                    items = json.loads(items_json)
+                    for item in items:
+                        st.write(
+                            f"- {item['name']} × {item['quantity']}"
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    st.write(items_json)
+
+                left, right = st.columns(2)
+
+                with left:
+                    if status == "Preparing":
+                        if st.button(
+                            "Mark Ready",
+                            key=f"ready_{order_id}",
+                            use_container_width=True
+                        ):
+                            update_order_status(order_id, "Ready")
+                            st.rerun()
+
+                with right:
                     if st.button(
-                        "Mark Ready",
-                        key=f'ready_{order["order_id"]}',
-                        type="primary"
+                        "Confirm ID & Token — Collected",
+                        key=f"collected_{order_id}",
+                        use_container_width=True
                     ):
-                        set_status(order["order_id"], "Ready")
-                        st.rerun()
+                        st.session_state[
+                            f"verify_{order_id}"
+                        ] = True
 
-                elif order["status"] == "Ready":
-                    st.success("Ready for pickup")
-
-                    st.caption(
-                        "Check the physical college ID and printed token. "
-                        "Collect payment at the counter before handing over food."
+                if st.session_state.get(f"verify_{order_id}", False):
+                    st.warning(
+                        "Before confirming, physically check the "
+                        "student's college ID and pickup token."
                     )
 
                     if st.button(
-                        "Confirm ID & Token — Collected",
-                        key=f'collected_{order["order_id"]}'
+                        "Confirm collection",
+                        key=f"confirm_{order_id}",
+                        type="primary"
                     ):
-                        set_status(order["order_id"], "Collected")
+                        update_order_status(order_id, "Collected")
+                        st.session_state.pop(
+                            f"verify_{order_id}", None
+                        )
                         st.rerun()
 
-    st.divider()
-    st.subheader("Find order by token or college ID")
+    st.markdown("---")
+    st.markdown("### Find an order")
 
     search_value = st.text_input(
-        "Enter pickup token or college ID",
-        placeholder="Example: 101 or Y25EC006",
-        key="staff_search"
+        "Enter pickup token, order ID, or college ID",
+        key="order_search"
     )
 
     if search_value.strip():
-        search = search_value.strip()
-        matches = [
+        matching = [
             order for order in orders
-            if str(order["token"]) == search
-            or normalize_id(order["student_id"]) == normalize_id(search)
+            if search_value.strip().lower() in {
+                str(order[1]).lower(),
+                str(order[2]).lower(),
+                str(order[4]).lower()
+            }
         ]
 
-        if matches:
-            for order in matches:
+        if matching:
+            for order in matching:
                 st.write(
-                    f'**Token {order["token"]}** — '
-                    f'{order["student_name"]} — '
-                    f'{order["student_id"]} — '
-                    f'{order["status"]}'
+                    f"**{order[1]}** · {order[3]} · "
+                    f"College ID: {order[4]} · "
+                    f"Token: {order[2]} · Status: {order[9]}"
                 )
         else:
-            st.warning("No matching order found.")
+            st.info("No matching order found.")
 
-# ==========================================================
-# 3. ADMIN AND ORDER HISTORY
-# ==========================================================
+# ==================================================
+# ADMIN
+# ==================================================
 
-with tab_admin:
+with admin_tab:
     st.subheader("Admin dashboard")
-
     orders = get_orders()
 
     total_orders = len(orders)
-    preparing_count = sum(
-        1 for order in orders if order["status"] == "Preparing"
-    )
-    ready_count = sum(
-        1 for order in orders if order["status"] == "Ready"
-    )
-    collected_count = sum(
-        1 for order in orders if order["status"] == "Collected"
-    )
+    preparing_count = sum(o[9] == "Preparing" for o in orders)
+    ready_count = sum(o[9] == "Ready" for o in orders)
+    collected_count = sum(o[9] == "Collected" for o in orders)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total orders", total_orders)
+    c1.metric("Total Orders", total_orders)
     c2.metric("Preparing", preparing_count)
     c3.metric("Ready", ready_count)
     c4.metric("Collected", collected_count)
 
-    st.caption(
-        "No PIN is required in this demonstration. Do not expose this "
-        "version publicly with real student or business data."
-    )
-
-    st.subheader("Order history")
+    st.markdown("### Order history")
 
     if orders:
-        rows = []
+        import pandas as pd
 
+        table_rows = []
         for order in orders:
-            rows.append({
-                "Order ID": order["order_id"],
-                "Token": order["token"],
-                "Student": order["student_name"],
-                "College ID": order["student_id"],
-                "Items": get_items_text(order),
-                "Amount": float(order["total"]),
-                "Payment method": order["payment_method"],
-                "Payment status": order["payment_status"],
-                "Status": order["status"],
-                "Created": order["created_at"],
+            table_rows.append({
+                "Order ID": order[1],
+                "Token": order[2],
+                "Student": order[3],
+                "College ID": order[4],
+                "Items": order[5],
+                "Total (₹)": order[6],
+                "Payment Option": order[7],
+                "Payment Status": order[8],
+                "Status": order[9],
+                "Created At": order[10]
             })
 
-        df = pd.DataFrame(rows)
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
+        df = pd.DataFrame(table_rows)
+        st.dataframe(df, use_container_width=True)
 
         st.download_button(
-            "Download order history CSV",
+            "Download Order History CSV",
             data=df.to_csv(index=False).encode("utf-8"),
             file_name="campusbites_orders.csv",
             mime="text/csv"
@@ -639,47 +601,18 @@ with tab_admin:
     else:
         st.info("No orders have been placed yet.")
 
-    st.subheader("Menu")
+    st.markdown("### Available menu")
+    menu = get_menu()
 
-    with connect_db() as conn:
-        menu_df = pd.read_sql_query(
-            "SELECT id, name, price, category, active FROM menu",
-            conn
-        )
+    if menu:
+        for item in menu:
+            st.write(
+                f"**{item['name']}** — ₹{item['price']:.2f} "
+                f"({item['category']})"
+            )
 
-    st.dataframe(
-        menu_df,
-        use_container_width=True,
-        hide_index=True
+    st.warning(
+        "Demo application: Kitchen and Admin tabs have no login. "
+        "Do not use this version for real student payments or "
+        "sensitive production data."
     )
-
-    st.caption(
-        "The menu can be edited in the SQLite database. "
-        "This app does not include an in-app menu editor."
-    )
-
-    st.divider()
-    st.subheader("Reset demo order history")
-
-    confirm_reset = st.checkbox(
-        "I understand this deletes all orders from the local database."
-    )
-
-    if st.button("Reset All Orders"):
-        if confirm_reset:
-            with connect_db() as conn:
-                conn.execute("DELETE FROM orders")
-
-            st.session_state.pop("last_order_id", None)
-            st.success("Order history cleared.")
-            st.rerun()
-        else:
-            st.error("Confirm before resetting.")
-
-# ---------------- FOOTER ----------------
-
-st.divider()
-st.caption(
-    "CampusBites · RVR & JC College of Engineering · "
-    "Prototype only · Payment collected separately at counter"
-)
